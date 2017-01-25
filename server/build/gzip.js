@@ -2,6 +2,9 @@ import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
 import glob from 'glob-promise'
+import buildSize from './build-size'
+
+const buildFiles = []
 
 export default async function gzipAssets (dir) {
   const nextDir = path.resolve(dir, '.next')
@@ -24,6 +27,7 @@ export default async function gzipAssets (dir) {
 
     await Promise.all(currentChunk.map(gzip))
   }
+  await buildSize(buildFiles)
 }
 
 export function gzip (filePath) {
@@ -33,6 +37,14 @@ export function gzip (filePath) {
   return new Promise((resolve, reject) => {
     const stream = input.pipe(zlib.createGzip()).pipe(output)
     stream.on('error', reject)
-    stream.on('finish', resolve)
+    stream.on('finish', () => {
+      buildFiles.push({
+        fileName: filePath,
+        uncompressed: fs.statSync(filePath).size,
+        compressed: fs.statSync(`${filePath}.gz`).size
+      })
+
+      resolve()
+    })
   })
 }
