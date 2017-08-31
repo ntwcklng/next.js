@@ -7,9 +7,11 @@
     "start": "next start"
   },
   "dependencies": {
-    "next": "^2.0.0-beta",
-    "styled-components": "1.2.1"
+    "babel-plugin-styled-components": "^1.1.5",
+    "next": "latest",
+    "react": "^15.6.1",
+    "react-dom": "^15.6.1",
+    "styled-components": "^2.1.0"
   },
-  "author": "",
   "license": "ISC"
 }

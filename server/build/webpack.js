@@ -1,4 +1,4 @@
-import { resolve, join } from 'path'
+import { resolve, join, sep } from 'path'
 import { createHash } from 'crypto'
 import webpack from 'webpack'
 import glob from 'glob-promise'
@@ -6,11 +6,13 @@ import WriteFilePlugin from 'write-file-webpack-plugin'
 import FriendlyErrorsWebpackPlugin from 'friendly-errors-webpack-plugin'
 import CaseSensitivePathPlugin from 'case-sensitive-paths-webpack-plugin'
 import UnlinkFilePlugin from './plugins/unlink-file-plugin'
-import WatchPagesPlugin from './plugins/watch-pages-plugin'
-import JsonPagesPlugin from './plugins/json-pages-plugin'
+import PagesPlugin from './plugins/pages-plugin'
+import DynamicChunksPlugin from './plugins/dynamic-chunks-plugin'
+import CombineAssetsPlugin from './plugins/combine-assets-plugin'
 import getConfig from '../config'
 import * as babelCore from 'babel-core'
-import findBabelConfigLocation from './babel/find-config-location'
+import findBabelConfig from './babel/find-config'
+import rootModuleRelativePath from './root-module-relative-path'
 
 const documentPage = join('pages', '_document.js')
 const defaultPages = [
@@ -23,38 +25,57 @@ const interpolateNames = new Map(defaultPages.map((p) => {
   return [join(nextPagesDir, p), `dist/pages/${p}`]
 }))
 
-export default async function createCompiler (dir, { dev = false, quiet = false } = {}) {
+const relativeResolve = rootModuleRelativePath(require)
+
+export default async function createCompiler (dir, { buildId, dev = false, quiet = false, buildDir, conf = null } = {}) {
   dir = resolve(dir)
-  const config = getConfig(dir)
-  const defaultEntries = dev
-    ? [join(__dirname, '..', '..', 'client/webpack-hot-middleware-client')] : []
+  const config = getConfig(dir, conf)
+  const defaultEntries = dev ? [
+    join(__dirname, '..', '..', 'client', 'webpack-hot-middleware-client'),
+    join(__dirname, '..', '..', 'client', 'on-demand-entries-client')
+  ] : []
   const mainJS = dev
     ? require.resolve('../../client/next-dev') : require.resolve('../../client/next')
 
-  let minChunks
+  let totalPages
 
   const entry = async () => {
-    const entries = { 'main.js': mainJS }
+    const entries = {
+      'main.js': [
+        ...defaultEntries,
+        mainJS
+      ]
+    }
 
     const pages = await glob('pages/**/*.js', { cwd: dir })
-    for (const p of pages) {
-      entries[join('bundles', p)] = [...defaultEntries, `./${p}?entry`]
+    const devPages = pages.filter((p) => p === 'pages/_document.js' || p === 'pages/_error.js')
+
+    // In the dev environment, on-demand-entry-handler will take care of
+    // managing pages.
+    if (dev) {
+      for (const p of devPages) {
+        entries[join('bundles', p)] = [`./${p}?entry`]
+      }
+    } else {
+      for (const p of pages) {
+        entries[join('bundles', p)] = [`./${p}?entry`]
+      }
     }
 
     for (const p of defaultPages) {
       const entryName = join('bundles', 'pages', p)
       if (!entries[entryName]) {
-        entries[entryName] = [...defaultEntries, join(nextPagesDir, p) + '?entry']
+        entries[entryName] = [join(nextPagesDir, p) + '?entry']
       }
     }
 
-    // calculate minChunks of CommonsChunkPlugin for later use
-    minChunks = Math.max(2, pages.filter((p) => p !== documentPage).length)
+    totalPages = pages.filter((p) => p !== documentPage).length
 
     return entries
   }
 
   const plugins = [
+    new webpack.IgnorePlugin(/(precomputed)/, /node_modules.+(elliptic)/),
     new webpack.LoaderOptionsPlugin({
       options: {
         context: dir,
@@ -73,12 +94,41 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
       name: 'commons',
       filename: 'commons.js',
       minChunks (module, count) {
-        // NOTE: it depends on the fact that the entry funtion is always called
-        // before applying CommonsChunkPlugin
-        return count >= minChunks
+        // We need to move react-dom explicitly into common chunks.
+        // Otherwise, if some other page or module uses it, it might
+        // included in that bundle too.
+        if (module.context && module.context.indexOf(`${sep}react-dom${sep}`) >= 0) {
+          return true
+        }
+
+        // In the dev we use on-demand-entries.
+        // So, it makes no sense to use commonChunks based on the minChunks count.
+        // Instead, we move all the code in node_modules into each of the pages.
+        if (dev) {
+          return false
+        }
+
+        // If there are one or two pages, only move modules to common if they are
+        // used in all of the pages. Otherwise, move modules used in at-least
+        // 1/2 of the total pages into commons.
+        if (totalPages <= 2) {
+          return count >= totalPages
+        }
+        return count >= totalPages * 0.5
       }
     }),
-    new JsonPagesPlugin(),
+    // This chunk contains all the webpack related code. So, all the changes
+    // related to that happens to this chunk.
+    // It won't touch commons.js and that gives us much better re-build perf.
+    new webpack.optimize.CommonsChunkPlugin({
+      name: 'manifest',
+      filename: 'manifest.js'
+    }),
+    new webpack.DefinePlugin({
+      'process.env.NODE_ENV': JSON.stringify(dev ? 'development' : 'production')
+    }),
+    new PagesPlugin(),
+    new DynamicChunksPlugin(),
     new CaseSensitivePathPlugin()
   ]
 
@@ -86,22 +136,24 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
     plugins.push(
       new webpack.HotModuleReplacementPlugin(),
       new webpack.NoEmitOnErrorsPlugin(),
-      new UnlinkFilePlugin(),
-      new WatchPagesPlugin(dir)
+      new UnlinkFilePlugin()
     )
     if (!quiet) {
       plugins.push(new FriendlyErrorsWebpackPlugin())
     }
   } else {
+    plugins.push(new webpack.IgnorePlugin(/react-hot-loader/))
     plugins.push(
-      new webpack.DefinePlugin({
-        'process.env.NODE_ENV': JSON.stringify('production')
+      new CombineAssetsPlugin({
+        input: ['manifest.js', 'commons.js', 'main.js'],
+        output: 'app.js'
       }),
       new webpack.optimize.UglifyJsPlugin({
         compress: { warnings: false },
         sourceMap: false
       })
     )
+    plugins.push(new webpack.optimize.ModuleConcatenationPlugin())
   }
 
   const nodePathList = (process.env.NODE_PATH || '')
@@ -109,17 +161,25 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
     .filter((p) => !!p)
 
   const mainBabelOptions = {
-    babelrc: true,
     cacheDirectory: true,
-    sourceMaps: dev ? 'both' : false,
     presets: []
   }
 
-  const configLocation = findBabelConfigLocation(dir)
-  if (configLocation) {
+  const externalBabelConfig = findBabelConfig(dir)
+  if (externalBabelConfig) {
     console.log(`> Using external babel configuration`)
-    console.log(`> location: "${configLocation}"`)
+    console.log(`> Location: "${externalBabelConfig.loc}"`)
+    // It's possible to turn off babelrc support via babelrc itself.
+    // In that case, we should add our default preset.
+    // That's why we need to do this.
+    const { options } = externalBabelConfig
+    mainBabelOptions.babelrc = options.babelrc !== false
   } else {
+    mainBabelOptions.babelrc = false
+  }
+
+  // Add our default preset if the no "babelrc" found.
+  if (!mainBabelOptions.babelrc) {
     mainBabelOptions.presets.push(require.resolve('./babel/preset'))
   }
 
@@ -155,10 +215,9 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
         if (!(/\.js$/.test(interpolatedName))) {
           return { content, sourceMap }
         }
-        const babelRuntimePath = require.resolve('babel-runtime/package')
-          .replace(/[\\/]package\.json$/, '')
+
         const transpiled = babelCore.transform(content, {
-          presets: [require.resolve('babel-preset-es2015')],
+          babelrc: false,
           sourceMaps: dev ? 'both' : false,
           // Here we need to resolve all modules to the absolute paths.
           // Earlier we did it with the babel-preset.
@@ -166,20 +225,21 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
           // That's why we need to do it here.
           // See more: https://github.com/zeit/next.js/issues/951
           plugins: [
+            [require.resolve('babel-plugin-transform-es2015-modules-commonjs')],
             [
               require.resolve('babel-plugin-module-resolver'),
               {
                 alias: {
-                  'babel-runtime': babelRuntimePath,
-                  react: require.resolve('react'),
-                  'react-dom': require.resolve('react-dom'),
-                  'react-dom/server': require.resolve('react-dom/server'),
-                  'next/link': require.resolve('../../lib/link'),
-                  'next/prefetch': require.resolve('../../lib/prefetch'),
-                  'next/css': require.resolve('../../lib/css'),
-                  'next/head': require.resolve('../../lib/head'),
-                  'next/document': require.resolve('../../server/document'),
-                  'next/router': require.resolve('../../lib/router')
+                  'babel-runtime': relativeResolve('babel-runtime/package'),
+                  'next/link': relativeResolve('../../lib/link'),
+                  'next/prefetch': relativeResolve('../../lib/prefetch'),
+                  'next/css': relativeResolve('../../lib/css'),
+                  'next/dynamic': relativeResolve('../../lib/dynamic'),
+                  'next/head': relativeResolve('../../lib/head'),
+                  'next/document': relativeResolve('../../server/document'),
+                  'next/router': relativeResolve('../../lib/router'),
+                  'next/error': relativeResolve('../../lib/error'),
+                  'styled-jsx/style': relativeResolve('styled-jsx/style')
                 }
               }
             ]
@@ -187,8 +247,23 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
           inputSourceMap: sourceMap
         })
 
+        // Strip ?entry to map back to filesystem and work with iTerm, etc.
+        let { map } = transpiled
+        let output = transpiled.code
+
+        if (map) {
+          map.sources = map.sources.map((source) => source.replace(/\?entry/, ''))
+          delete map.sourcesContent
+
+          // Output explicit inline source map that source-map-support can pickup via requireHook mode.
+          // Since these are not formal chunks, the devtool infrastructure in webpack does not output
+          // a source map for these files.
+          const sourceMapUrl = new Buffer(JSON.stringify(map), 'utf-8').toString('base64')
+          output = `${output}\n//# sourceMappingURL=data:application/json;charset=utf-8;base64,${sourceMapUrl}`
+        }
+
         return {
-          content: transpiled.code,
+          content: output,
           sourceMap: transpiled.map
         }
       }
@@ -202,7 +277,6 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
     options: {
       babelrc: false,
       cacheDirectory: true,
-      sourceMaps: dev ? 'both' : false,
       presets: [require.resolve('./babel/preset')]
     }
   }, {
@@ -219,10 +293,10 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
     context: dir,
     entry,
     output: {
-      path: join(dir, '.next'),
+      path: buildDir ? join(buildDir, '.next') : join(dir, config.distDir),
       filename: '[name]',
       libraryTarget: 'commonjs2',
-      publicPath: '/_webpack/',
+      publicPath: `/_next/${buildId}/webpack/`,
       strictModuleExceptionHandling: true,
       devtoolModuleFilenameTemplate ({ resourcePath }) {
         const hash = createHash('sha1')
@@ -231,7 +305,9 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
 
         // append hash id for cache busting
         return `webpack:///${resourcePath}?${id}`
-      }
+      },
+      // This saves chunks with the name given via require.ensure()
+      chunkFilename: '[name]'
     },
     resolve: {
       modules: [
@@ -252,12 +328,12 @@ export default async function createCompiler (dir, { dev = false, quiet = false 
     module: {
       rules
     },
-    devtool: dev ? 'inline-source-map' : false,
+    devtool: dev ? 'cheap-module-inline-source-map' : false,
     performance: { hints: false }
   }
 
   if (config.webpack) {
-    console.log('> Using "webpack" config function defined in next.config.js.')
+    console.log(`> Using "webpack" config function defined in ${config.configOrigin}.`)
     webpackConfig = await config.webpack(webpackConfig, { dev })
   }
   return webpack(webpackConfig)
